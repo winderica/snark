@@ -10,7 +10,7 @@
     rust_2018_idioms,
     missing_docs
 )]
-#![deny(unsafe_code)]
+// #![deny(unsafe_code)]
 
 #[macro_use]
 extern crate ark_std;

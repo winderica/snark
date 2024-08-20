@@ -29,7 +29,7 @@ pub type Matrix<F> = Vec<Vec<(F, usize)>>;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 /// An opaque counter for symbolic linear combinations.
-pub struct LcIndex(usize);
+pub struct LcIndex(pub usize);
 
 /// Represents the different kinds of variables present in a constraint system.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -41,9 +41,8 @@ pub enum Variable {
     /// Represents a public instance variable.
     Instance(usize),
     /// Represents a private witness variable.
-    Witness(usize),
     Committed(usize),
-    Commitment(usize),
+    Witness(usize),
     /// Represents of a linear combination.
     SymbolicLc(LcIndex),
 }

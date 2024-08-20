@@ -5,7 +5,7 @@ use ark_ff::Field;
 use ark_std::{
     any::{Any, TypeId},
     boxed::Box,
-    cell::{Ref, RefCell, RefMut},
+    cell::{Ref, RefCell, RefMut, UnsafeCell},
     collections::BTreeMap,
     format,
     rc::Rc,
@@ -43,7 +43,6 @@ pub struct ConstraintSystem<F: Field> {
     /// system.
     pub num_witness_variables: usize,
     pub num_committed_variables: usize,
-    pub num_commitments: usize,
     /// The number of constraints in the constraint system.
     pub num_constraints: usize,
     /// The number of linear combinations
@@ -61,21 +60,24 @@ pub struct ConstraintSystem<F: Field> {
     pub witness_assignment: Vec<F>,
 
     pub committed_assignment: Vec<F>,
-    pub commitment_assignment: Vec<F>,
 
     /// Map for gadgets to cache computation results.
     pub cache_map: Rc<RefCell<BTreeMap<TypeId, Box<dyn Any>>>>,
 
-    lc_map: BTreeMap<LcIndex, LinearCombination<F>>,
+    pub lc_map: BTreeMap<LcIndex, LinearCombination<F>>,
 
     #[cfg(feature = "std")]
     constraint_traces: Vec<Option<ConstraintTrace>>,
 
-    a_constraints: Vec<LcIndex>,
-    b_constraints: Vec<LcIndex>,
-    c_constraints: Vec<LcIndex>,
+    pub a_constraints: Vec<LcIndex>,
+    pub b_constraints: Vec<LcIndex>,
+    pub c_constraints: Vec<LcIndex>,
 
     lc_assignment_cache: Rc<RefCell<BTreeMap<LcIndex, F>>>,
+
+    pub w_offset: usize,
+    pub q_offset: usize,
+    pub lc_offset: usize,
 }
 
 impl<F: Field> Default for ConstraintSystem<F> {
@@ -124,19 +126,18 @@ impl<F: Field> ConstraintSystem<F> {
                         *coeff,
                         match var {
                             // The one variable always has index 0
+                            Variable::Zero => unreachable!(),
                             Variable::One => 0,
                             Variable::Instance(i) => *i,
-                            Variable::Commitment(i) => self.num_instance_variables + *i,
                             Variable::Committed(i) => {
-                                self.num_instance_variables + self.num_commitments + *i
-                            }
+                                self.num_instance_variables + *i
+                            },
                             Variable::Witness(i) => {
-                                self.num_committed_variables
+                                    self.num_committed_variables
                                     + self.num_instance_variables
-                                    + self.num_commitments
                                     + *i
-                            }
-                            _ => panic!(),
+                            },
+                            Variable::SymbolicLc(_) => unreachable!(),
                         },
                     ))
                 }
@@ -150,7 +151,6 @@ impl<F: Field> ConstraintSystem<F> {
             num_instance_variables: 1,
             num_witness_variables: 0,
             num_committed_variables: 0,
-            num_commitments: 0,
             num_constraints: 0,
             num_linear_combinations: 0,
             a_constraints: Vec::new(),
@@ -159,7 +159,6 @@ impl<F: Field> ConstraintSystem<F> {
             instance_assignment: vec![F::one()],
             witness_assignment: Vec::new(),
             committed_assignment: Vec::new(),
-            commitment_assignment: Vec::new(),
             cache_map: Rc::new(RefCell::new(BTreeMap::new())),
             #[cfg(feature = "std")]
             constraint_traces: Vec::new(),
@@ -172,6 +171,43 @@ impl<F: Field> ConstraintSystem<F> {
             },
 
             optimization_goal: OptimizationGoal::Constraints,
+
+            w_offset: 0,
+            q_offset: 0,
+            lc_offset: 0,
+        }
+    }
+
+    /// Construct an empty `ConstraintSystem`.
+    pub fn new_offset(w_offset: usize, q_offset: usize, lc_offset: usize) -> Self {
+        Self {
+            num_instance_variables: 1,
+            num_witness_variables: 0,
+            num_committed_variables: 0,
+            num_constraints: 0,
+            num_linear_combinations: 0,
+            a_constraints: Vec::new(),
+            b_constraints: Vec::new(),
+            c_constraints: Vec::new(),
+            instance_assignment: vec![F::one()],
+            witness_assignment: Vec::new(),
+            committed_assignment: Vec::new(),
+            cache_map: Rc::new(RefCell::new(BTreeMap::new())),
+            #[cfg(feature = "std")]
+            constraint_traces: Vec::new(),
+
+            lc_map: BTreeMap::new(),
+            lc_assignment_cache: Rc::new(RefCell::new(BTreeMap::new())),
+
+            mode: SynthesisMode::Prove {
+                construct_matrices: true,
+            },
+
+            optimization_goal: OptimizationGoal::Constraints,
+
+            w_offset,
+            q_offset,
+            lc_offset,
         }
     }
 
@@ -199,7 +235,8 @@ impl<F: Field> ConstraintSystem<F> {
     /// Specify whether this constraint system should aim to optimize weight,
     /// number of constraints, or neither.
     pub fn set_optimization_goal(&mut self, goal: OptimizationGoal) {
-        // `set_optimization_goal` should only be executed before any constraint or value is created.
+        // `set_optimization_goal` should only be executed before any constraint or
+        // value is created.
         assert_eq!(self.num_instance_variables, 1);
         assert_eq!(self.num_witness_variables, 0);
         assert_eq!(self.num_committed_variables, 0);
@@ -252,7 +289,7 @@ impl<F: Field> ConstraintSystem<F> {
     where
         Func: FnOnce() -> crate::r1cs::Result<F>,
     {
-        let index = self.num_witness_variables;
+        let index = self.num_witness_variables + self.w_offset;
         self.num_witness_variables += 1;
 
         if !self.is_in_setup_mode() {
@@ -267,7 +304,7 @@ impl<F: Field> ConstraintSystem<F> {
     where
         Func: FnOnce() -> crate::r1cs::Result<F>,
     {
-        let index = self.num_committed_variables;
+        let index = self.num_committed_variables + self.q_offset;
         self.num_committed_variables += 1;
 
         if !self.is_in_setup_mode() {
@@ -276,32 +313,36 @@ impl<F: Field> ConstraintSystem<F> {
         Ok(Variable::Committed(index))
     }
 
-    /// Obtain a variable representing a new private witness input.
-    #[inline]
-    pub fn new_commitment<Func>(&mut self, f: Func) -> crate::r1cs::Result<Variable>
-    where
-        Func: FnOnce() -> crate::r1cs::Result<F>,
-    {
-        let index = self.num_commitments;
-        self.num_commitments += 1;
-
-        if !self.is_in_setup_mode() {
-            self.commitment_assignment.push(f()?);
-        }
-
-        Ok(Variable::Commitment(index))
-    }
-
     /// Obtain a variable representing a linear combination.
     #[inline]
     pub fn new_lc(&mut self, lc: LinearCombination<F>) -> crate::r1cs::Result<Variable> {
-        let index = LcIndex(self.num_linear_combinations);
+        let index = LcIndex(self.num_linear_combinations + self.lc_offset);
         let var = Variable::SymbolicLc(index);
 
-        self.lc_map.insert(index, lc);
+        if self.should_construct_matrices() {
+            self.lc_map.insert(index, lc);
+        }
 
         self.num_linear_combinations += 1;
         Ok(var)
+    }
+
+    #[inline]
+    pub fn merge(css: Vec<Self>) -> Self {
+        let mut cs = Self::new();
+        for i in css {
+            assert_eq!(i.num_instance_variables, 1);
+            cs.num_witness_variables += i.num_witness_variables;
+            cs.num_constraints += i.num_constraints;
+            cs.num_linear_combinations += i.num_linear_combinations;
+            cs.witness_assignment
+                .extend_from_slice(&i.witness_assignment);
+            cs.lc_map.extend(i.lc_map);
+            cs.a_constraints.extend_from_slice(&i.a_constraints);
+            cs.b_constraints.extend_from_slice(&i.b_constraints);
+            cs.c_constraints.extend_from_slice(&i.c_constraints);
+        }
+        cs
     }
 
     /// Enforce a R1CS constraint with the name `name`.
@@ -321,11 +362,11 @@ impl<F: Field> ConstraintSystem<F> {
             self.c_constraints.push(c_index);
         }
         self.num_constraints += 1;
-        #[cfg(feature = "std")]
-        {
-            let trace = ConstraintTrace::capture();
-            self.constraint_traces.push(trace);
-        }
+        // #[cfg(feature = "std")]
+        // {
+        //     let trace = ConstraintTrace::capture();
+        //     self.constraint_traces.push(trace);
+        // }
         Ok(())
     }
 
@@ -352,15 +393,17 @@ impl<F: Field> ConstraintSystem<F> {
     /// Transform the map of linear combinations.
     /// Specifically, allow the creation of additional witness assignments.
     ///
-    /// This method is used as a subroutine of `inline_all_lcs` and `outline_lcs`.
+    /// This method is used as a subroutine of `inline_all_lcs` and
+    /// `outline_lcs`.
     ///
-    /// The transformer function is given a references of this constraint system (&self),
-    /// number of times used, and a mutable reference of the linear combination to be transformed.
-    ///     (&ConstraintSystem<F>, usize, &mut LinearCombination<F>)
+    /// The transformer function is given a references of this constraint system
+    /// (&self), number of times used, and a mutable reference of the linear
+    /// combination to be transformed.     (&ConstraintSystem<F>, usize,
+    /// &mut LinearCombination<F>)
     ///
-    /// The transformer function returns the number of new witness variables needed
-    /// and a vector of new witness assignments (if not in the setup mode).
-    ///     (usize, Option<Vec<F>>)
+    /// The transformer function returns the number of new witness variables
+    /// needed and a vector of new witness assignments (if not in the setup
+    /// mode).     (usize, Option<Vec<F>>)
     pub fn transform_lc_map(
         &mut self,
         transformer: &mut dyn FnMut(
@@ -683,10 +726,9 @@ impl<F: Field> ConstraintSystem<F> {
         match v {
             Variable::One => Some(F::one()),
             Variable::Zero => Some(F::zero()),
-            Variable::Witness(idx) => self.witness_assignment.get(idx).copied(),
-            Variable::Committed(idx) => self.committed_assignment.get(idx).copied(),
+            Variable::Witness(idx) => self.witness_assignment.get(idx - self.w_offset).copied(),
+            Variable::Committed(idx) => self.committed_assignment.get(idx - self.q_offset).copied(),
             Variable::Instance(idx) => self.instance_assignment.get(idx).copied(),
-            Variable::Commitment(idx) => self.commitment_assignment.get(idx).copied(),
             Variable::SymbolicLc(idx) => {
                 let value = self.lc_assignment_cache.borrow().get(&idx).copied();
                 if value.is_some() {
@@ -741,7 +783,7 @@ pub enum ConstraintSystemRef<F: Field> {
     None,
     /// Represents the case where we *do* allocate variables or enforce
     /// constraints.
-    CS(Rc<RefCell<ConstraintSystem<F>>>),
+    CS(Rc<UnsafeCell<ConstraintSystem<F>>>),
 }
 
 impl<F: Field> PartialEq for ConstraintSystemRef<F> {
@@ -814,10 +856,10 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// Construct a `ConstraintSystemRef` from a `ConstraintSystem`.
     #[inline]
     pub fn new(inner: ConstraintSystem<F>) -> Self {
-        Self::CS(Rc::new(RefCell::new(inner)))
+        Self::CS(Rc::new(UnsafeCell::new(inner)))
     }
 
-    fn inner(&self) -> Option<&Rc<RefCell<ConstraintSystem<F>>>> {
+    fn inner(&self) -> Option<&Rc<UnsafeCell<ConstraintSystem<F>>>> {
         match self {
             Self::CS(a) => Some(a),
             Self::None => None,
@@ -839,8 +881,8 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// # Panics
     /// This method panics if `self` is already mutably borrowed.
     #[inline]
-    pub fn borrow(&self) -> Option<Ref<'_, ConstraintSystem<F>>> {
-        self.inner().map(|cs| cs.borrow())
+    pub fn borrow(&self) -> Option<&ConstraintSystem<F>> {
+        self.inner().map(|cs| unsafe { &*cs.get() })
     }
 
     /// Obtain a mutable reference to the underlying `ConstraintSystem`.
@@ -848,79 +890,67 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// # Panics
     /// This method panics if `self` is already mutably borrowed.
     #[inline]
-    pub fn borrow_mut(&self) -> Option<RefMut<'_, ConstraintSystem<F>>> {
-        self.inner().map(|cs| cs.borrow_mut())
+    pub fn borrow_mut(&self) -> Option<&mut ConstraintSystem<F>> {
+        self.inner().map(|cs| unsafe { &mut *cs.get() })
     }
 
     /// Set `self.mode` to `mode`.
     pub fn set_mode(&self, mode: SynthesisMode) {
-        self.inner().map_or((), |cs| cs.borrow_mut().set_mode(mode))
+        self.borrow_mut().map_or((), |cs| cs.set_mode(mode))
     }
 
     /// Check whether `self.mode == SynthesisMode::Setup`.
     #[inline]
     pub fn is_in_setup_mode(&self) -> bool {
-        self.inner()
-            .map_or(false, |cs| cs.borrow().is_in_setup_mode())
+        self.borrow().map_or(false, |cs| cs.is_in_setup_mode())
     }
 
     /// Returns the number of constraints.
     #[inline]
     pub fn num_constraints(&self) -> usize {
-        self.inner().map_or(0, |cs| cs.borrow().num_constraints)
+        self.borrow().map_or(0, |cs| cs.num_constraints)
     }
 
     /// Returns the number of instance variables.
     #[inline]
-    pub fn num_instance_and_commitment_variables(&self) -> usize {
-        self.inner().map_or(0, |cs| {
-            let cs = cs.borrow();
-            cs.num_instance_variables + cs.num_commitments
-        })
+    pub fn num_instance_variables(&self) -> usize {
+        self.borrow()
+            .map_or(0, |cs| cs.num_instance_variables)
     }
 
     /// Returns the number of witness variables.
     #[inline]
     pub fn num_witness_variables(&self) -> usize {
-        self.inner()
-            .map_or(0, |cs| cs.borrow().num_witness_variables)
+        self.borrow().map_or(0, |cs| cs.num_witness_variables)
     }
 
     /// Returns the number of witness variables.
     #[inline]
     pub fn num_committed_variables(&self) -> usize {
-        self.inner()
-            .map_or(0, |cs| cs.borrow().num_committed_variables)
-    }
-
-    /// Returns the number of witness variables.
-    #[inline]
-    pub fn num_commitments(&self) -> usize {
-        self.inner().map_or(0, |cs| cs.borrow().num_commitments)
+        self.borrow().map_or(0, |cs| cs.num_committed_variables)
     }
 
     /// Check whether this constraint system aims to optimize weight,
     /// number of constraints, or neither.
     #[inline]
     pub fn optimization_goal(&self) -> OptimizationGoal {
-        self.inner().map_or(OptimizationGoal::Constraints, |cs| {
-            cs.borrow().optimization_goal()
-        })
+        self.borrow()
+            .map_or(OptimizationGoal::Constraints, |cs| cs.optimization_goal())
     }
 
     /// Specify whether this constraint system should aim to optimize weight,
     /// number of constraints, or neither.
     #[inline]
     pub fn set_optimization_goal(&self, goal: OptimizationGoal) {
-        self.inner()
-            .map_or((), |cs| cs.borrow_mut().set_optimization_goal(goal))
+        self.borrow_mut()
+            .map_or((), |cs| cs.set_optimization_goal(goal))
     }
 
     /// Check whether or not `self` will construct matrices.
     #[inline]
     pub fn should_construct_matrices(&self) -> bool {
-        self.inner()
-            .map_or(false, |cs| cs.borrow().should_construct_matrices())
+        self.borrow()
+            .map_or(false, |cs| cs.should_construct_matrices())
     }
 
     /// Obtain a variable representing a new public instance input.
@@ -929,16 +959,16 @@ impl<F: Field> ConstraintSystemRef<F> {
     where
         Func: FnOnce() -> crate::r1cs::Result<F>,
     {
-        self.inner()
+        self.borrow_mut()
             .ok_or(SynthesisError::MissingCS)
             .and_then(|cs| {
                 if !self.is_in_setup_mode() {
                     // This is needed to avoid double-borrows, because `f`
                     // might itself mutably borrow `cs` (eg: `f = || g.value()`).
                     let value = f();
-                    cs.borrow_mut().new_input_variable(|| value)
+                    cs.new_input_variable(|| value)
                 } else {
-                    cs.borrow_mut().new_input_variable(f)
+                    cs.new_input_variable(f)
                 }
             })
     }
@@ -949,16 +979,16 @@ impl<F: Field> ConstraintSystemRef<F> {
     where
         Func: FnOnce() -> crate::r1cs::Result<F>,
     {
-        self.inner()
+        self.borrow_mut()
             .ok_or(SynthesisError::MissingCS)
             .and_then(|cs| {
                 if !self.is_in_setup_mode() {
                     // This is needed to avoid double-borrows, because `f`
                     // might itself mutably borrow `cs` (eg: `f = || g.value()`).
                     let value = f();
-                    cs.borrow_mut().new_witness_variable(|| value)
+                    cs.new_witness_variable(|| value)
                 } else {
-                    cs.borrow_mut().new_witness_variable(f)
+                    cs.new_witness_variable(f)
                 }
             })
     }
@@ -969,36 +999,16 @@ impl<F: Field> ConstraintSystemRef<F> {
     where
         Func: FnOnce() -> crate::r1cs::Result<F>,
     {
-        self.inner()
+        self.borrow_mut()
             .ok_or(SynthesisError::MissingCS)
             .and_then(|cs| {
                 if !self.is_in_setup_mode() {
                     // This is needed to avoid double-borrows, because `f`
                     // might itself mutably borrow `cs` (eg: `f = || g.value()`).
                     let value = f();
-                    cs.borrow_mut().new_committed_variable(|| value)
+                    cs.new_committed_variable(|| value)
                 } else {
-                    cs.borrow_mut().new_committed_variable(f)
-                }
-            })
-    }
-
-    /// Obtain a variable representing a new private witness input.
-    #[inline]
-    pub fn new_commitment<Func>(&self, f: Func) -> crate::r1cs::Result<Variable>
-    where
-        Func: FnOnce() -> crate::r1cs::Result<F>,
-    {
-        self.inner()
-            .ok_or(SynthesisError::MissingCS)
-            .and_then(|cs| {
-                if !self.is_in_setup_mode() {
-                    // This is needed to avoid double-borrows, because `f`
-                    // might itself mutably borrow `cs` (eg: `f = || g.value()`).
-                    let value = f();
-                    cs.borrow_mut().new_commitment(|| value)
-                } else {
-                    cs.borrow_mut().new_commitment(f)
+                    cs.new_committed_variable(f)
                 }
             })
     }
@@ -1006,9 +1016,9 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// Obtain a variable representing a linear combination.
     #[inline]
     pub fn new_lc(&self, lc: LinearCombination<F>) -> crate::r1cs::Result<Variable> {
-        self.inner()
+        self.borrow_mut()
             .ok_or(SynthesisError::MissingCS)
-            .and_then(|cs| cs.borrow_mut().new_lc(lc))
+            .and_then(|cs| cs.new_lc(lc))
     }
 
     /// Enforce a R1CS constraint with the name `name`.
@@ -1019,9 +1029,9 @@ impl<F: Field> ConstraintSystemRef<F> {
         b: LinearCombination<F>,
         c: LinearCombination<F>,
     ) -> crate::r1cs::Result<()> {
-        self.inner()
+        self.borrow_mut()
             .ok_or(SynthesisError::MissingCS)
-            .and_then(|cs| cs.borrow_mut().enforce_constraint(a, b, c))
+            .and_then(|cs| cs.enforce_constraint(a, b, c))
     }
 
     /// Naively inlines symbolic linear combinations into the linear
@@ -1033,16 +1043,16 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// do not contribute to the size of the multi-scalar multiplication, which
     /// is the dominating cost.
     pub fn inline_all_lcs(&self) {
-        if let Some(cs) = self.inner() {
-            cs.borrow_mut().inline_all_lcs()
+        if let Some(cs) = self.borrow_mut() {
+            cs.inline_all_lcs()
         }
     }
 
     /// Finalize the constraint system (either by outlining or inlining,
     /// if an optimization goal is set).
     pub fn finalize(&self) {
-        if let Some(cs) = self.inner() {
-            cs.borrow_mut().finalize()
+        if let Some(cs) = self.borrow_mut() {
+            cs.finalize()
         }
     }
 
@@ -1051,16 +1061,16 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// are used.
     #[inline]
     pub fn to_matrices(&self) -> Option<ConstraintMatrices<F>> {
-        self.inner().and_then(|cs| cs.borrow().to_matrices())
+        self.borrow().and_then(|cs| cs.to_matrices())
     }
 
     /// If `self` is satisfied, outputs `Ok(true)`.
     /// If `self` is unsatisfied, outputs `Ok(false)`.
     /// If `self.is_in_setup_mode()` or if `self == None`, outputs `Err(())`.
     pub fn is_satisfied(&self) -> crate::r1cs::Result<bool> {
-        self.inner()
+        self.borrow()
             .map_or(Err(SynthesisError::AssignmentMissing), |cs| {
-                cs.borrow().is_satisfied()
+                cs.is_satisfied()
             })
     }
 
@@ -1069,24 +1079,23 @@ impl<F: Field> ConstraintSystemRef<F> {
     /// the first unsatisfied constraint.
     /// If `self.is_in_setup_mode()` or `self == None`, outputs `Err(())`.
     pub fn which_is_unsatisfied(&self) -> crate::r1cs::Result<Option<String>> {
-        self.inner()
+        self.borrow()
             .map_or(Err(SynthesisError::AssignmentMissing), |cs| {
-                cs.borrow().which_is_unsatisfied()
+                cs.which_is_unsatisfied()
             })
     }
 
     /// Obtain the assignment corresponding to the `Variable` `v`.
     pub fn assigned_value(&self, v: Variable) -> Option<F> {
-        self.inner().and_then(|cs| cs.borrow().assigned_value(v))
+        self.borrow().and_then(|cs| cs.assigned_value(v))
     }
 
     /// Get trace information about all constraints in the system
     pub fn constraint_names(&self) -> Option<Vec<String>> {
         #[cfg(feature = "std")]
         {
-            self.inner().and_then(|cs| {
-                cs.borrow()
-                    .constraint_traces
+            self.borrow().and_then(|cs| {
+                cs.constraint_traces
                     .iter()
                     .map(|trace| {
                         let mut constraint_path = String::new();
@@ -1215,7 +1224,8 @@ mod tests {
         // There will be six variables in the system, in the order governed by adding
         // them to the constraint system (Note that the CS is initialised with
         // `Variable::One` in the first position implicitly).
-        // Note also that the all public variables will always be placed before all witnesses
+        // Note also that the all public variables will always be placed before all
+        // witnesses
         //
         // Variable::One
         // Variable::Instance(35)
@@ -1246,7 +1256,8 @@ mod tests {
         // There are four gates(constraints), each generating a row.
         // Resulting matrices:
         // (Note how 2nd & 3rd columns are swapped compared to the online example.
-        // This results from an implementation detail of placing all Variable::Instances(_) first.
+        // This results from an implementation detail of placing all
+        // Variable::Instances(_) first.
         //
         // A
         // [0, 0, 1, 0, 0, 0]
