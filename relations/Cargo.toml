@@ -23,4 +23,5 @@ ark-test-curves = { workspace = true, features = [ "bls12_381_scalar_field" ] }
 
 [features]
 default = []
-std = [ "ark-std/std", "ark-ff/std", "tracing-subscriber", "tracing/std" ]
+std = [ "ark-std/std", "ark-ff/std" ]
+tracing = [ "tracing-subscriber", "tracing/std", "std" ]

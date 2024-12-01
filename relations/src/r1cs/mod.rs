@@ -9,10 +9,10 @@ pub type Result<T> = core::result::Result<T, SynthesisError>;
 mod impl_lc;
 mod constraint_system;
 mod error;
-#[cfg(feature = "std")]
+#[cfg(feature = "tracing")]
 mod trace;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "tracing")]
 pub use crate::r1cs::trace::{ConstraintLayer, ConstraintTrace, TraceStep, TracingMode};
 
 pub use tracing::info_span;
